@@ -1,125 +1,59 @@
-# PRD — Nodo sensorial Arduino de dirección
+# Product Requirements Document & Spec - Arduino Dirección
 
-**Proyecto:** Tunnel Lab — Dirección  
-**Documento:** `PRD_Spec_Arduino_Direccion.md`  
-**Rol:** Especificación de restricciones de hardware industrial  
-**Estado:** Borrador inicial  
-**Alcance de este documento:** Restricciones absolutas del nodo. No incluye implementación en C++.
+**Subsistema:** Módulo de Dirección (Sensórica)
 
----
+**Hardware:** Arduino + Ethernet Shield (PoE)
 
-## 1. Propósito
+**Lenguaje:** C++ / Arduino Framework
 
-Definir el contrato del Arduino de dirección como **nodo estrictamente sensorial**. El nodo adquiere medidas de orientación, posición angular de los anillos de dirección y estado de los fines de carrera, las empaqueta en un formato binario estructurado y las entrega al servidor central.
+## 1. Visión y Alcance
 
-El nodo **no participa en el lazo de mando** de los motores de dirección.
+Este nodo microcontrolador actuará exclusivamente como el sistema nervioso (lectura) del módulo de dirección de la tuneladora. Su única responsabilidad es adquirir datos físicos del entorno a través de sensores (IMUs, encoders y fines de carrera) y transmitirlos ininterrumpidamente al Servidor Central (Controlador Supervisor) mediante la red Ethernet. 
 
----
+Por regla arquitectónica inquebrantable de separación de roles, este dispositivo tiene **estrictamente prohibido** ejecutar lógica de control, evaluar umbrales de seguridad, o enviar comandos eléctricos a los actuadores físicos (motores de las cuñas).
 
-## 2. Restricciones absolutas
+## 2. Mapa de Hardware y Sensórica (IO List)
 
-Estas reglas no se relajan por conveniencia de firmware, de red ni de puesta en marcha.
+El Arduino se alimentará del bus DC de bajo voltaje aislado (PoE) para garantizar que la lectura de telemetría sobreviva a un corte de energía de los motores de 480V.
 
-| ID | Restricción | Criterio de cumplimiento |
-| --- | --- | --- |
-| R-01 | El Arduino opera como nodo estrictamente sensorial. | El firmware solo lee sensores y transmite telemetría. No calcula consignas, no cierra lazo y no arbitra movimiento. |
-| R-02 | Queda prohibido enviar comandos físicos a los motores de dirección. | No existen salidas de mando hacia drivers, contactores, variadores ni cualquier actuador de dirección. Ningún mensaje saliente constituye una orden de movimiento. |
-| R-03 | La conectividad es Ethernet con alimentación PoE e IP fija. | La dirección IP pertenece al rango `192.168.1.10`–`192.168.1.19` y no se obtiene por DHCP. |
-| R-04 | La telemetría se publica en un bucle continuo. | El ciclo principal no se detiene entre lecturas ni entre envíos hacia el servidor central. |
-| R-05 | El payload es binario estructurado. | Cada trama corresponde a un `struct` con las lecturas del ciclo. No se usa texto libre como formato de intercambio. |
-| R-06 | El transporte es un socket TCP o UDP hacia el servidor central. | El nodo es cliente de publicación. El servidor central es el único destinatario de la telemetría. |
+Debe censar los siguientes componentes:
 
----
+*   **IMU (Unidad de Medición Inercial):** Comunicación I2C. Provee la base para calcular Roll, Pitch y Heading (Orientación del cabezal).
 
-## 3. Hardware
+*   **Encoders Absolutos (x2):** Miden los grados de rotación exactos de las cuñas direccionales (Motor A y Motor B).
 
-### 3.1 Plataforma
+*   **Fines de Carrera (Limit Switches x2):** Entradas digitales físicas que indican si los anillos han alcanzado su tope mecánico máximo de ±10°.
 
-- Placa Arduino.
-- Shield Ethernet con PoE.
+## 3. Capacidades del Sistema (Capabilities)
 
-El shield es la única interfaz de red del nodo y la vía de alimentación prevista (PoE). No se define en este documento otro bus de campo ni otra interfaz de mando.
+- **CAP-1 - Adquisición de Alta Frecuencia (Oversampling)**
 
-### 3.2 Direccionamiento
+  - intent: El microcontrolador lee todos los sensores físicos conectados a la mayor velocidad que permita el hardware, garantizando que el servidor Python reciba datos frescos con sobremuestreo.
 
-| Parámetro | Valor |
-| --- | --- |
-| Modo | IP fija |
-| Rango autorizado | `192.168.1.10` a `192.168.1.19` |
-| Fuera de rango | No permitido |
+  - success: El bucle `loop()` de C++ se ejecuta sin funciones bloqueantes `delay()`) y actualiza las variables en memoria a una tasa mínima sostenida de 50 Hz.
 
-Cada nodo desplegado ocupa una única dirección de ese rango. La elección concreta dentro del rango es de asignación de planta; el firmware no puede salir de él.
+- **CAP-2 - Transmisión de Telemetría Binaria (Push)**
 
-### 3.3 Frontera eléctrica de actuación
+  - intent: El Arduino empuja su estado actual hacia la IP del servidor central mediante un socket de red ligero, evitando el procesamiento de texto o formatos pesados.
 
-El nodo no dispone de canal de mando hacia los motores de dirección. Cualquier pin, relé, PWM, bus o mensaje que pudiera mover un motor queda fuera de esta especificación y está prohibido.
+  - success: Los datos se empaquetan en un `struct` estricto de C++ y se transmiten vía **UDP** a una tasa configurable (mínimo 10 Hz). No se utiliza JSON en la capa del microcontrolador.
 
----
+- **CAP-3 - Nodo Sensorial Puro (Dumb Node)**
 
-## 4. Sensores a monitorear
+  - intent: El microcontrolador ignora por completo la toma de decisiones lógicas o de seguridad (Interlocks).
 
-El nodo solo monitorea los tres grupos siguientes.
+  - success: Si un fin de carrera se activa, el Arduino simplemente envía un `1` (true) en el bit correspondiente de su *struct*. No apaga nada ni altera su propio flujo; el servidor Python es el encargado exclusivo de leer ese `1` y disparar el E-STOP hacia el PLC.
 
-### 4.1 IMU (I2C)
+- **CAP-4 - Resiliencia y Auto-Recuperación**
 
-- Bus: I2C.
-- Magnitudes: Roll, Pitch y Heading.
-- Función: orientación del conjunto. La IMU no se usa para generar órdenes de dirección.
+  - intent: El Arduino debe sobrevivir a caídas de red físicas y recuperar la transmisión sin intervención humana.
 
-### 4.2 Encoders absolutos
+  - success: Si se desconecta y reconecta el cable Ethernet físico, la placa reinicializa su socket y reanuda el envío de paquetes UDP hacia el servidor en menos de 2 segundos sin requerir un reinicio eléctrico (reboot).
 
-- Función: posición angular de los anillos de dirección.
-- Naturaleza: encoders absolutos. La posición de cada anillo debe poder leerse sin depender de un cero relativo reconstruido por el nodo.
+## 4. Restricciones Técnicas (Constraints)
 
-### 4.3 Fines de carrera mecánicos
+- **Cero Lógica Web:** El Arduino NO expondrá un servidor HTTP ni endpoints web. Todo el tráfico saliente es un *stream* UDP hacia una IP receptora (el servidor Python) y un puerto predefinidos.
 
-- Función: estado de los límites mecánicos de carrera.
-- Naturaleza: contactos mecánicos. El nodo informa su estado; no los usa para accionar motores.
+- **Sin Credenciales Hardcodeadas:** La configuración de red local (MAC address, IP estática en el rango `192.168.1.10 - 192.168.1.19`, IP del servidor destino) debe estar declarada en un bloque de constantes al inicio del código para su rápida modificación en terreno.
 
----
-
-## 5. Comportamiento del firmware
-
-El código C++ —fuera del alcance de este documento— deberá cumplir este comportamiento y ningún otro de mando:
-
-1. Ejecutar un **bucle infinito**.
-2. En cada iteración, leer los sensores del apartado 4.
-3. Empaquetar esas lecturas en un **`struct` binario**.
-4. Transmitir el `struct` por un **socket TCP o UDP** al servidor central.
-5. Repetir el ciclo **sin interrupciones**: el bucle no se suspende a la espera de un comando de movimiento ni inserta una pausa que corte la publicación continua.
-
-El nodo no acepta, no interpreta y no ejecuta consignas de dirección. Si el enlace con el servidor se degrada, el nodo sigue siendo sensorial: no pasa a un modo de actuación local.
-
----
-
-## 6. Contrato de datos
-
-La trama es un bloque binario con diseño de `struct`. Como mínimo transporta, por cada ciclo:
-
-- Roll, Pitch y Heading de las IMU.
-- Posición absoluta de los anillos de dirección.
-- Estado de los fines de carrera mecánicos.
-
-No se define en este paso el layout de campos, el endianness ni el puerto. Esos detalles pertenecen a la especificación de protocolo, posterior a este PRD. Lo que queda cerrado aquí es el formato: binario estructurado, no un comando.
-
-La trama es de **observación**. No contiene campos de consigna, habilitación de drive, sentido de giro ni cualquier otro actuador.
-
----
-
-## 7. Fuera de alcance
-
-- Código fuente C++ y cualquier sketch de Arduino.
-- Definición del layout binario, puertos y elección final entre TCP y UDP.
-- Servidor central, visualización e historial.
-- Drivers, variadores y motores de dirección.
-- Estrategia de control, homing o recuperación de movimiento.
-
----
-
-## 8. Criterios de aceptación del nodo
-
-1. Con alimentación PoE y shield Ethernet, el nodo anuncia una IP fija dentro de `192.168.1.10`–`192.168.1.19`.
-2. Publica de forma continua lecturas de IMU (Roll, Pitch, Heading), encoders absolutos de los anillos y fines de carrera mecánicos.
-3. Cada publicación es un `struct` binario enviado por socket TCP o UDP al servidor central.
-4. No existe salida ni mensaje capaz de comandar los motores de dirección.
-5. El bucle de adquisición y envío no se interrumpe para ejecutar una acción física.
+- **Tipado Fijo:** El tamaño en bytes del `struct` de envío (payload) debe ser inmutable para que el servidor Python pueda desempaquetarlo sistemáticamente usando la librería `struct`.
