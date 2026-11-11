@@ -1,59 +1,137 @@
-# Product Requirements Document & Spec - Arduino Dirección
+Product Requirements Document & Spec — Arduino Dirección
 
-**Subsistema:** Módulo de Dirección (Sensórica)
+**Subsistema:** Módulo de Dirección (Sensórica) — micro-tuneladora B.I.C.H.O. (UDD Tunnel Lab)
 
-**Hardware:** Arduino + Ethernet Shield (PoE)
+**Revisión:** 2.1 (Final - Sincronizado a Backend) · **Fase:** MVP (Pruebas físicas de laboratorio y lazo cerrado)
 
-**Lenguaje:** C++ / Arduino Framework
+**Hardware:** Arduino Mega 2560 + Ethernet Shield W5500
 
-## 1. Visión y Alcance
+**Alimentación:** Bus DC de bajo voltaje aislado (PoE con splitter a 9-12V)
 
-Este nodo microcontrolador actuará exclusivamente como el sistema nervioso (lectura) del módulo de dirección de la tuneladora. Su única responsabilidad es adquirir datos físicos del entorno a través de sensores (IMUs, encoders y fines de carrera) y transmitirlos ininterrumpidamente al Servidor Central (Controlador Supervisor) mediante la red Ethernet. 
+**Lenguaje:** C++ / Arduino Framework (Clean Architecture)
 
-Por regla arquitectónica inquebrantable de separación de roles, este dispositivo tiene **estrictamente prohibido** ejecutar lógica de control, evaluar umbrales de seguridad, o enviar comandos eléctricos a los actuadores físicos (motores de las cuñas).
+**Red:** IP estática `192.168.1.10` (Tráfico saliente UDP Push)
 
-## 2. Mapa de Hardware y Sensórica (IO List)
+---
 
-El Arduino se alimentará del bus DC de bajo voltaje aislado (PoE) para garantizar que la lectura de telemetría sobreviva a un corte de energía de los motores de 480V.
+## 1. Visión y Regla Inquebrantable de Arquitectura
 
-Debe censar los siguientes componentes:
+Este nodo microcontrolador actúa exclusivamente como el sistema nervioso periférico del módulo de dirección de la tuneladora (mecanismo de cuñas rotatorias, ±10°). Adquiere datos físicos ininterrumpidamente y los transmite al Servidor Central (Python).
 
-*   **IMU (Unidad de Medición Inercial):** Comunicación I2C. Provee la base para calcular Roll, Pitch y Heading (Orientación del cabezal).
+> **REGLA DE ACERO (Solo Lectura):** Este dispositivo tiene TERMINANTEMENTE PROHIBIDO ejecutar lógica de control, evaluar interlocks o enviar comandos eléctricos. El control motriz de 480 V recae exclusivamente en el PLC SEW independiente. Toda decisión de aborto y validación cruzada vive en el Servidor Central.
 
-*   **Encoders Absolutos (x2):** Miden los grados de rotación exactos de las cuñas direccionales (Motor A y Motor B).
+---
 
-*   **Fines de Carrera (Limit Switches x2):** Entradas digitales físicas que indican si los anillos han alcanzado su tope mecánico máximo de ±10°.
+## 2. Capa Física y Hardening Industrial EMI
 
-## 3. Capacidades del Sistema (Capabilities)
+El entorno de 480 V exige protecciones severas contra ruido eléctrico e inducción.
 
-- **CAP-1 - Adquisición de Alta Frecuencia (Oversampling)**
+| ID | Señal | Interfaz / Requisito Eléctrico |
 
-  - intent: El microcontrolador lee todos los sensores físicos conectados a la mayor velocidad que permita el hardware, garantizando que el servidor Python reciba datos frescos con sobremuestreo.
+|---|---|---|
 
-  - success: El bucle `loop()` de C++ se ejecuta sin funciones bloqueantes `delay()`) y actualiza las variables en memoria a una tasa mínima sostenida de 50 Hz.
+| `DIR-01` | IMU (Roll, Pitch, Heading) | **I2C diferencial.** Obligatorio transceptor PCA9615 en ambos extremos sobre par trenzado. Reloj a 100 kHz. |
 
-- **CAP-2 - Transmisión de Telemetría Binaria (Push)**
+| `DIR-02` | Encoder absoluto — Anillo A | **Externo.** Montado mecánicamente en la cuña, independiente del motor SEW. |
 
-  - intent: El Arduino empuja su estado actual hacia la IP del servidor central mediante un socket de red ligero, evitando el procesamiento de texto o formatos pesados.
+| `DIR-03` | Encoder absoluto — Anillo B | **Externo.** Montado mecánicamente en la cuña, independiente del motor SEW. |
 
-  - success: Los datos se empaquetan en un `struct` estricto de C++ y se transmiten vía **UDP** a una tasa configurable (mínimo 10 Hz). No se utiliza JSON en la capa del microcontrolador.
+| `DIR-04` | Fin de carrera +10° (Tope A) | **Normalmente Cerrado (NC).** Entrada optoacoplada a 5V. |
 
-- **CAP-3 - Nodo Sensorial Puro (Dumb Node)**
+| `DIR-05` | Fin de carrera −10° (Tope B) | **Normalmente Cerrado (NC).** Entrada optoacoplada a 5V. |
 
-  - intent: El microcontrolador ignora por completo la toma de decisiones lógicas o de seguridad (Interlocks).
+| `DIR-06` | Inclinómetro doble eje | Sensor de redundancia física. Lectura pasiva. |
 
-  - success: Si un fin de carrera se activa, el Arduino simplemente envía un `1` (true) en el bit correspondiente de su *struct*. No apaga nada ni altera su propio flujo; el servidor Python es el encargado exclusivo de leer ese `1` y disparar el E-STOP hacia el PLC.
+*Nota de Seguridad en Fines de Carrera (NC):* El cableado debe garantizar que un circuito abierto (cable cortado, ficha desconectada) se lea como `0` lógico en el pin (falla/tope activo), desencadenando una condición segura.
 
-- **CAP-4 - Resiliencia y Auto-Recuperación**
+---
 
-  - intent: El Arduino debe sobrevivir a caídas de red físicas y recuperar la transmisión sin intervención humana.
+## 3. Capacidades de Software (Capabilities)
 
-  - success: Si se desconecta y reconecta el cable Ethernet físico, la placa reinicializa su socket y reanuda el envío de paquetes UDP hacia el servidor en menos de 2 segundos sin requerir un reinicio eléctrico (reboot).
+### CAP-1: Bucle de Adquisición No Bloqueante (50 Hz)
 
-## 4. Restricciones Técnicas (Constraints)
+El código evalúa `millis()` para muestrear los sensores físicos a exactamente **50 Hz** (cada 20 ms).
 
-- **Cero Lógica Web:** El Arduino NO expondrá un servidor HTTP ni endpoints web. Todo el tráfico saliente es un *stream* UDP hacia una IP receptora (el servidor Python) y un puerto predefinidos.
+* **Prohibición Estricta:** Cero uso de `delay()`.
+* **Debounce y Latch:** Los fines de carrera deben filtrarse por software requiriendo un estado estable de mínimo **50 ms** (3 lecturas consecutivas a 50Hz) antes de validar un cambio. Todo tope detectado `0` lógico) debe quedar retenido (latch) en memoria hasta ser transmitido por red para no perder impactos rápidos.
+* **Timeouts de Bus:** Toda lectura (I2C/SPI) debe tener un timeout acotado. Un sensor no puede congelar el `loop()`.
 
-- **Sin Credenciales Hardcodeadas:** La configuración de red local (MAC address, IP estática en el rango `192.168.1.10 - 192.168.1.19`, IP del servidor destino) debe estar declarada en un bloque de constantes al inicio del código para su rápida modificación en terreno.
+### CAP-2: Transmisión Binaria y Resiliencia UDP (10 Hz)
 
-- **Tipado Fijo:** El tamaño en bytes del `struct` de envío (payload) debe ser inmutable para que el servidor Python pueda desempaquetarlo sistemáticamente usando la librería `struct`.
+Los datos se empujan proactivamente vía socket UDP a **10 Hz**, sincronizándose con el bucle maestro del Servidor Python.
+
+* **Bloqueo de Ethernet Prevenido:** La función `endPacket()` del W5500 bloquea el chip si no hay enlace. El envío UDP debe estar **gateado por hardware**: el Arduino sondeará `Ethernet.linkStatus()` y solo intentará enviar el paquete si el cable está físicamente conectado y el switch responde.
+
+### CAP-3: Watchdog de Hardware y Health-Check
+
+El `struct` UDP incluye un contador secuencial `sequence_number`) y un bitmask de salud física `hardware_status`).
+
+* **Criterio de Falla:** Si un sensor I2C sufre un timeout, da NACK, o envía N lecturas idénticas seguidas (congelamiento de bus), su bit de salud baja a `0`.
+* **Propagación Inmediata (Fail-Fast):** Si un sensor falla, su variable `float` asociada se seteará forzosamente a `NaN` `0x7FC00000`).
+* El servidor Python evalúa esta estructura y dispara el Global Abort.
+
+---
+
+## 4. Contrato de Red (Capa de Aplicación)
+
+### 4.1. Estructura Binaria Estricta (38 Bytes, Little-Endian)
+
+Se exige empaquetado continuo en memoria `__attribute__((packed))`), orden de bytes Little-Endian, y flotantes IEEE 754 de 32 bits.
+
+```cpp
+
+#include <stdint.h>
+
+#include <math.h>
+
+// Contrato Binario Estricto (UDP Payload) - Little Endian
+
+struct __attribute__((packed)) SteeringTelemetry {
+
+    uint32_t sequence_number; // [0-4294967295] Detección de salto/pérdida UDP
+
+    uint32_t timestamp_ms;    // Uptime local. Python asigna Unix Epoch absoluto al recibir.
+
+    // Posición y Orientación (IEEE 754 - 32 bit floats)
+
+    float roll_deg;           // [DIR-01] IMU
+
+    float pitch_deg;          // [DIR-01] IMU
+
+    float heading_deg;        // [DIR-01] IMU
+
+    float inc_pitch_deg;      // [DIR-06] Inclinómetro
+
+    float inc_roll_deg;       // [DIR-06] Inclinómetro
+
+    float encoder_a_deg;      // [DIR-02] Anillo A
+
+    float encoder_b_deg;      // [DIR-03] Anillo B
+
+    // Discretos y Salud (8-bit)
+
+    uint8_t limit_switches;   // Bitmask [Bit0: Tope A, Bit1: Tope B] (1 = Libre/Seguro, 0 = Tope/Cable Roto)
+
+    uint8_t hardware_status;  // Health Bitmask (1=OK, 0=Falla) [Bit0: IMU, Bit1: Inc, Bit2: EncA...]
+
+};
+```
+
+### Guardas de Compilación en C++:
+
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "Requiere Little-Endian");
+
+static_assert(sizeof(float) == 4, "Float debe ser de 32 bits");
+
+static_assert(sizeof(SteeringTelemetry) == 38, "Contrato roto: El tamaño debe ser 38 bytes");
+
+## 5. Advertencias y Alternativas Consideradas (Design Rationale)
+
+> **PROPÓSITO DE ESTA SECCIÓN:** Documentar el *por qué* de las decisiones de diseño arquitectónico. Ningún ingeniero futuro debe "simplificar" estos requerimientos sin entender el modo de falla catastrófica que están previniendo.
+
+1. **Arduino Mega 2560 (5V) vs Teensy 4.1 (3.3V):** Se descartó la potencia de 32-bits del Teensy porque su lógica de 3.3V es altamente susceptible al ruido y requiere *level-shifters* para los sensores industriales. El Mega 2560 opera nativamente a 5V, brindando inmunidad eléctrica superior, lo cual es crítico cerca de motores de 480V.
+2. **Muestreo a 50Hz / Transmisión a 10Hz:** Se adquieren datos a alta velocidad (50Hz) para detectar colisiones en los topes mecánicos en 20ms y filtrarlos (debounce) internamente. Sin embargo, la transmisión por red se rebajó a 10Hz para sincronizarse perfectamente con el reloj asíncrono del Servidor Python, evitando la acumulación de datos (buffer bloat) en la red[cite: 19].
+3. **I2C Diferencial Obligatorio (PCA9615):** Ante la incertidumbre de la longitud final del cableado dentro del cabezal, el protocolo I2C estándar (Single-Ended) fue prohibido. Un cable I2C largo actúa como antena para el ruido de los variadores (VFD). El transceptor diferencial anula el ruido de modo común, garantizando que la tuneladora no pierda su IMU por EMI.
+4. **Fines de Carrera Normalmente Cerrados (NC):** Si se utilizaran contactos NO (Normalmente Abiertos), un cable cortado por la maquinaria sería indistinguible de una pista libre, permitiendo una colisión mecánica a toda potencia. Al usar NC, cualquier cable roto corta la corriente, el Arduino lee un `0`, y detiene la máquina por diseño (Fail-Safe).
+5. **Flotantes "NaN" (Not a Number):** En lugar de transmitir el "último valor conocido" o `0.0` cuando un sensor se desconecta, el Arduino inyecta forzosamente un `NaN` matemático en el struct. Esto obliga a la capa Python a colapsar de manera segura y ruidosa (Fail-Fast) si el programador del backend olvidó evaluar el bitmask de salud del sensor, evitando que el algoritmo de navegación opere sobre datos fantasma.
+6. **Tamaño del Struct Fijo (38 Bytes):** Se descartó agregar verificaciones redundantes (CRC16 de aplicación) porque la cabecera UDP ya incorpora un *checksum* nativo que descarta tramas corruptas. La detección de cables sueltos se confía al `sequence_number` y al Watchdog del servidor.
